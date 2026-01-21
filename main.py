@@ -596,6 +596,10 @@ JSON:"""
 class ConversationRequest(BaseModel):
     conversation: str
 
+class OutboundConversationRequest(BaseModel):
+    conversation: str
+    phone_number: str
+
 
 @app.get("/health")
 async def health_check():
@@ -774,6 +778,171 @@ async def process_conversation(request: ConversationRequest):
         raise
     except Exception as e:
         logger.error(f"Error processing conversation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/process-outbound")
+async def process_outbound_conversation(request: OutboundConversationRequest):
+    """
+    Process conversation data for outbound calls:
+    Phase 1: Use provided phone number, detect languages, and check/create user
+    Phase 2: Generate/update analytics
+    
+    This endpoint is used when the agent makes outbound calls and already knows the phone number.
+    """
+    try:
+        conversation = request.conversation
+        phone_number_raw = request.phone_number
+        
+        if not conversation or not conversation.strip():
+            raise HTTPException(status_code=400, detail="Conversation data is required")
+        
+        if not phone_number_raw or not phone_number_raw.strip():
+            raise HTTPException(status_code=400, detail="Phone number is required for outbound calls")
+        
+        logger.info("Starting outbound conversation processing...")
+        
+        # Normalize the provided phone number
+        phone_number = normalize_phone_number(phone_number_raw)
+        
+        if len(phone_number) != 10:
+            raise HTTPException(status_code=400, detail=f"Invalid phone number format: {phone_number_raw} (normalized to {phone_number})")
+        
+        logger.info(f"Using provided phone number for outbound call: {phone_number}")
+        
+        # Detect languages used in the conversation
+        logger.info("Phase 1: Detecting languages used in conversation...")
+        languages_used = detect_languages(conversation)
+        logger.info(f"Detected languages: {languages_used}")
+        
+        # Detect scholarship interests
+        logger.info("Phase 1: Detecting scholarship interests...")
+        scholarships = detect_scholarship_interests(conversation)
+        logger.info(f"Detected scholarship interests: {scholarships}")
+        
+        # Check if user exists
+        client = get_mongodb_client()
+        db = client["ALLIANCE"]
+        users_collection = db["users"]
+        analytics_collection = db["userAnalytics"]
+        
+        # Try to find user by phone number
+        phone_db_format = f"91{phone_number}"
+        user = users_collection.find_one({"phone_number": phone_db_format})
+        
+        if not user:
+            # User doesn't exist - create new user
+            logger.info("User not found, creating new user...")
+            # Try to extract email from conversation as well
+            email = extract_email(conversation)
+            user = create_user_from_conversation(conversation, phone_number=phone_number, email=email)
+            
+            if not user:
+                client.close()
+                raise HTTPException(status_code=500, detail="Failed to create user")
+        else:
+            logger.info(f"User found: {user.get('name', 'Unknown')}")
+        
+        user_id = user.get("_id")
+        
+        if not user_id:
+            client.close()
+            raise HTTPException(status_code=500, detail="User ID not found")
+        
+        # Phase 2: Generate/update analytics
+        logger.info("Phase 2: Generating analytics...")
+        analytics_doc = generate_analytics(conversation, user_id)
+        
+        if not analytics_doc:
+            client.close()
+            raise HTTPException(status_code=500, detail="Failed to generate analytics")
+        
+        # Check if analytics already exists for this user
+        existing_analytics = analytics_collection.find_one({"user_id": ObjectId(user_id)})
+        
+        if existing_analytics:
+            # Update existing analytics
+            logger.info("Updating existing analytics...")
+            
+            # If follow_up field is missing in existing analytics, add it
+            if "follow_up" not in existing_analytics:
+                logger.info("follow_up field missing in existing analytics, adding it...")
+                # Detect follow-up from current conversation
+                follow_up = detect_follow_up(conversation)
+                analytics_doc["follow_up"] = follow_up
+                logger.info(f"Added follow_up field: {follow_up}")
+            
+            # Update with new analytics data
+            analytics_collection.update_one(
+                {"user_id": ObjectId(user_id)},
+                {"$set": analytics_doc}
+            )
+            analytics_doc["_id"] = existing_analytics.get("_id")
+            logger.info("Analytics updated successfully")
+        else:
+            # Insert new analytics
+            logger.info("Creating new analytics...")
+            result = analytics_collection.insert_one(analytics_doc)
+            analytics_doc["_id"] = result.inserted_id
+            logger.info("Analytics created successfully")
+        
+        # Phase 3: Store conversation history
+        logger.info("Phase 3: Storing conversation history...")
+        conversation_history_collection = db["conversationHistory"]
+        
+        # Normalize conversation tags to strict "User:" and "Agent:" format
+        normalized_conversation = normalize_conversation_tags(conversation)
+        logger.info("Normalized conversation tags to strict 'User:' and 'Agent:' format")
+        
+        # Always create a new conversation history document (users can have many conversations)
+        conversation_history_doc = {
+            "user_id": ObjectId(user_id),
+            "conversation": normalized_conversation,  # Store the normalized conversation with strict tags
+            "timestamp": datetime.now(),  # Add timestamp to track when conversation occurred
+            "languages_used": languages_used,  # Add languages detected in Phase 1
+            "scholarships": scholarships  # Add scholarship interests detected in Phase 1
+        }
+        
+        # Insert new conversation history (always create new document)
+        logger.info("Creating new conversation history document...")
+        result = conversation_history_collection.insert_one(conversation_history_doc)
+        conversation_history_doc["_id"] = result.inserted_id
+        logger.info(f"Conversation history created successfully with ID: {result.inserted_id}")
+        
+        client.close()
+        
+        # Prepare response
+        response = {
+            "status": "success",
+            "message": "Outbound conversation processed successfully",
+            "user": {
+                "_id": str(user.get("_id")),
+                "name": user.get("name"),
+                "email": user.get("email"),
+                "phone_number": user.get("phone_number")
+            },
+            "analytics": {
+                "_id": str(analytics_doc.get("_id")),
+                "user_id": str(analytics_doc.get("user_id")),
+                "course_interest": analytics_doc.get("course_interest"),
+                "city": analytics_doc.get("city"),
+                "budget": analytics_doc.get("budget"),
+                "hostel_needed": analytics_doc.get("hostel_needed"),
+                "intent_level": analytics_doc.get("intent_level")
+            },
+            "conversation_history": {
+                "_id": str(conversation_history_doc.get("_id")),
+                "user_id": str(conversation_history_doc.get("user_id")),
+                "conversation": conversation_history_doc.get("conversation")
+            }
+        }
+        
+        return JSONResponse(content=response)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing outbound conversation: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
