@@ -516,7 +516,7 @@ JSON:"""
         return False
 
 
-def generate_analytics(conversation: str, user_id: ObjectId) -> Optional[dict]:
+def generate_analytics(conversation: str, user_id: Optional[ObjectId] = None) -> Optional[dict]:
     """Generate analytics from conversation using OpenAI"""
     try:
         prompt = f"""Analyze the following conversation and extract analytics information about the user.
@@ -576,7 +576,6 @@ JSON:"""
         intent_level = intent_level.upper() if isinstance(intent_level, str) else "TOFU"
         
         analytics_doc = {
-            "user_id": user_id,
             "course_interest": course_interest,
             "city": city,
             "budget": budget_formatted,
@@ -584,6 +583,10 @@ JSON:"""
             "intent_level": intent_level,
             "follow_up": follow_up
         }
+        
+        # Only add user_id if it's not None
+        if user_id is not None:
+            analytics_doc["user_id"] = user_id
         
         return analytics_doc
         
@@ -633,11 +636,12 @@ async def process_conversation(request: ConversationRequest):
             email = extract_email(conversation)
             
             if not email:
-                raise HTTPException(status_code=400, detail="Could not extract phone number or email from conversation")
-            
-            logger.info(f"Extracted email: {email}")
+                logger.warning("No phone number or email found in conversation. Processing with user_id as None.")
         else:
             logger.info(f"Extracted phone number: {phone_number}")
+        
+        if email:
+            logger.info(f"Extracted email: {email}")
         
         # Detect languages used in the conversation
         logger.info("Phase 1: Detecting languages used in conversation...")
@@ -656,6 +660,7 @@ async def process_conversation(request: ConversationRequest):
         analytics_collection = db["userAnalytics"]
         
         user = None
+        user_id = None
         
         # Try to find user by phone number first (if available)
         if phone_number:
@@ -667,61 +672,68 @@ async def process_conversation(request: ConversationRequest):
             email_normalized = email.lower().strip()
             user = users_collection.find_one({"email": email_normalized})
         
-        if not user:
-            # User doesn't exist - create new user
+        if not user and (phone_number or email):
+            # User doesn't exist but we have phone/email - create new user
             logger.info("User not found, creating new user...")
             user = create_user_from_conversation(conversation, phone_number=phone_number, email=email)
             
-            if not user:
-                client.close()
-                raise HTTPException(status_code=500, detail="Failed to create user")
-        else:
+            if user:
+                user_id = user.get("_id")
+                logger.info(f"Created new user: {user.get('name', 'Unknown')}")
+            else:
+                logger.warning("Failed to create user, continuing with user_id as None")
+        elif user:
             logger.info(f"User found: {user.get('name', 'Unknown')}")
+            user_id = user.get("_id")
+        else:
+            logger.info("No phone number or email found, processing conversation with user_id as None")
         
-        user_id = user.get("_id")
-        
-        if not user_id:
-            client.close()
-            raise HTTPException(status_code=500, detail="User ID not found")
-        
-        # Phase 2: Generate/update analytics
+        # Phase 2: Generate analytics (even if user_id is None)
         logger.info("Phase 2: Generating analytics...")
         analytics_doc = generate_analytics(conversation, user_id)
         
         if not analytics_doc:
-            client.close()
-            raise HTTPException(status_code=500, detail="Failed to generate analytics")
-        
-        # Check if analytics already exists for this user
-        existing_analytics = analytics_collection.find_one({"user_id": ObjectId(user_id)})
-        
-        if existing_analytics:
-            # Update existing analytics
-            logger.info("Updating existing analytics...")
+            logger.warning("Failed to generate analytics, continuing without analytics")
+            analytics_doc = None
+        elif user_id:
+            # Only insert/update analytics if we have a user_id
+            # Check if analytics already exists for this user
+            existing_analytics = analytics_collection.find_one({"user_id": ObjectId(user_id)})
             
-            # If follow_up field is missing in existing analytics, add it
-            if "follow_up" not in existing_analytics:
-                logger.info("follow_up field missing in existing analytics, adding it...")
-                # Detect follow-up from current conversation
-                follow_up = detect_follow_up(conversation)
-                analytics_doc["follow_up"] = follow_up
-                logger.info(f"Added follow_up field: {follow_up}")
-            
-            # Update with new analytics data
-            analytics_collection.update_one(
-                {"user_id": ObjectId(user_id)},
-                {"$set": analytics_doc}
-            )
-            analytics_doc["_id"] = existing_analytics.get("_id")
-            logger.info("Analytics updated successfully")
+            if existing_analytics:
+                # Update existing analytics
+                logger.info("Updating existing analytics...")
+                
+                # If follow_up field is missing in existing analytics, add it
+                if "follow_up" not in existing_analytics:
+                    logger.info("follow_up field missing in existing analytics, adding it...")
+                    # Detect follow-up from current conversation
+                    follow_up = detect_follow_up(conversation)
+                    analytics_doc["follow_up"] = follow_up
+                    logger.info(f"Added follow_up field: {follow_up}")
+                
+                # Update with new analytics data
+                analytics_collection.update_one(
+                    {"user_id": ObjectId(user_id)},
+                    {"$set": analytics_doc}
+                )
+                analytics_doc["_id"] = existing_analytics.get("_id")
+                logger.info("Analytics updated successfully")
+            else:
+                # Insert new analytics
+                logger.info("Creating new analytics...")
+                result = analytics_collection.insert_one(analytics_doc)
+                analytics_doc["_id"] = result.inserted_id
+                logger.info("Analytics created successfully")
         else:
-            # Insert new analytics
-            logger.info("Creating new analytics...")
+            # No user_id, but still generate analytics for tracking purposes
+            # Insert analytics with user_id as None
+            logger.info("Inserting analytics with user_id as None...")
             result = analytics_collection.insert_one(analytics_doc)
             analytics_doc["_id"] = result.inserted_id
-            logger.info("Analytics created successfully")
+            logger.info("Analytics created successfully with user_id as None")
         
-        # Phase 3: Store conversation history
+        # Phase 3: Store conversation history (always, even if user_id is None)
         logger.info("Phase 3: Storing conversation history...")
         conversation_history_collection = db["conversationHistory"]
         
@@ -731,7 +743,7 @@ async def process_conversation(request: ConversationRequest):
         
         # Always create a new conversation history document (users can have many conversations)
         conversation_history_doc = {
-            "user_id": ObjectId(user_id),
+            "user_id": ObjectId(user_id) if user_id else None,
             "conversation": normalized_conversation,  # Store the normalized conversation with strict tags
             "timestamp": datetime.now(),  # Add timestamp to track when conversation occurred
             "languages_used": languages_used,  # Add languages detected in Phase 1
@@ -751,23 +763,23 @@ async def process_conversation(request: ConversationRequest):
             "status": "success",
             "message": "Conversation processed successfully",
             "user": {
-                "_id": str(user.get("_id")),
-                "name": user.get("name"),
-                "email": user.get("email"),
-                "phone_number": user.get("phone_number")
-            },
+                "_id": str(user.get("_id")) if user and user.get("_id") else None,
+                "name": user.get("name") if user else None,
+                "email": user.get("email") if user else None,
+                "phone_number": user.get("phone_number") if user else None
+            } if user else None,
             "analytics": {
-                "_id": str(analytics_doc.get("_id")),
-                "user_id": str(analytics_doc.get("user_id")),
-                "course_interest": analytics_doc.get("course_interest"),
-                "city": analytics_doc.get("city"),
-                "budget": analytics_doc.get("budget"),
-                "hostel_needed": analytics_doc.get("hostel_needed"),
-                "intent_level": analytics_doc.get("intent_level")
-            },
+                "_id": str(analytics_doc.get("_id")) if analytics_doc and analytics_doc.get("_id") else None,
+                "user_id": str(analytics_doc.get("user_id")) if analytics_doc and analytics_doc.get("user_id") else None,
+                "course_interest": analytics_doc.get("course_interest") if analytics_doc else None,
+                "city": analytics_doc.get("city") if analytics_doc else None,
+                "budget": analytics_doc.get("budget") if analytics_doc else None,
+                "hostel_needed": analytics_doc.get("hostel_needed") if analytics_doc else None,
+                "intent_level": analytics_doc.get("intent_level") if analytics_doc else None
+            } if analytics_doc else None,
             "conversation_history": {
                 "_id": str(conversation_history_doc.get("_id")),
-                "user_id": str(conversation_history_doc.get("user_id")),
+                "user_id": str(conversation_history_doc.get("user_id")) if conversation_history_doc.get("user_id") else None,
                 "conversation": conversation_history_doc.get("conversation")
             }
         }
@@ -948,5 +960,5 @@ async def process_outbound_conversation(request: OutboundConversationRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8003"))
+    port = int(os.getenv("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
