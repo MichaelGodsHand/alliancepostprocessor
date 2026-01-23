@@ -90,8 +90,8 @@ def normalize_conversation_tags(conversation: str) -> str:
     
     for line in lines:
         # Pattern to match various agent tag formats (case-insensitive)
-        # Matches: "Natalie (Agent):", "Agent (natalie):", "Agent:", "Natalie:", etc.
-        agent_pattern = r'^(?:Natalie\s*\(Agent\)|Agent\s*\([^)]*\)|Natalie|Agent)\s*:\s*(.*)$'
+        # Matches: "Priya (Agent):", "Agent (priya):", "Agent:", "Priya:", etc.
+        agent_pattern = r'^(?:Priya\s*\(Agent\)|Agent\s*\([^)]*\)|Priya|Agent)\s*:\s*(.*)$'
         # Pattern to match user tag variations (case-insensitive)
         user_pattern = r'^User\s*:\s*(.*)$'
         
